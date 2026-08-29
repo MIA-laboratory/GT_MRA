@@ -1,0 +1,26 @@
+# Patient-derived data must never be committed
+data/
+DICOMdata/
+rawJPEG/
+rawPNG/
+*.dcm
+*.DCM
+mip_images/
+captures/
+
+# Model weights and large artefacts
+models/
+*.pth
+*.pt
+results/
+
+# Bundled runtime
+python/
+ffmpeg/
+
+# Generated output
+__pycache__/
+*.pyc
+figs/
+*.docx
+*.pdf
