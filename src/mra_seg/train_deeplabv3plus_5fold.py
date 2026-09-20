@@ -1,348 +1,236 @@
-"""
-DeepLabV3+ 5-Fold Cross-Validation for MRA Vessel Segmentation
-Baseline: Yamada et al. Appl. Sci. 2025, 15, 3034
-- Binary segmentation: intracranial vessel ROI vs background
-- Data augmentation: rotation, scaling, horizontal flip
-- 5-fold cross-validation at case level
-"""
+"""Supervised seed training: DeepLabV3+ (ResNet-50), case-level 5-fold CV.
 
-import os
+Settings as in Section 2.2 of the paper: SGD with momentum 0.9, initial
+learning rate 0.007 with polynomial decay (power 0.9), weight decay 1e-4,
+batch size 24, 132 epochs, combined Dice-CE loss, online augmentation.
+
+The test fold is evaluated every EVAL_EVERY epochs; the checkpoint with the
+best test-fold DSC is saved (both the best-epoch and the final-epoch values
+are logged). The saved checkpoints are the seeds of the evolutionary update.
+
+Usage:
+    python train_deeplabv3plus_5fold.py [fold ...]     # default: all 5 folds
+"""
+import json
+import random
 import sys
 import time
-import json
-import glob
-import random
 import warnings
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
+import albumentations as A
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision.models.segmentation import deeplabv3_resnet50
-from PIL import Image
-import albumentations as A
 from albumentations.pytorch import ToTensorV2
+from PIL import Image
 from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader, Dataset
+from torchvision.models.segmentation import deeplabv3_resnet50
 
 warnings.filterwarnings("ignore")
-
-# ============================================================
-# Configuration (matching paper parameters)
-# ============================================================
-# All paths live in paths.py, resolved relative to the project root.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from paths import MRA_SEG_DIR, FOLD_MODEL_V1_DIR, SEG_RESULT_DIR, ensure_dirs  # noqa: E402
-
-DATA_DIR = MRA_SEG_DIR            # rawJPEG / rawPNG / DICOMdata
-OUTPUT_DIR = FOLD_MODEL_V1_DIR    # weights of this version, kept apart from v2
-RESULT_DIR = SEG_RESULT_DIR       # evaluation results (JSON)
-ensure_dirs(OUTPUT_DIR, RESULT_DIR)
-
-NUM_FOLDS = 5
-NUM_EPOCHS = 3
-BATCH_SIZE = 8           # actual GPU batch
-ACCUM_STEPS = 8          # gradient accumulation -> effective batch = 64
-INITIAL_LR = 0.01
-LR_DECAY_FACTOR = 0.3
-NUM_CLASSES = 2  # background + vessel
-IMG_SIZE = 512
-NUM_WORKERS = 2
-SEED = 42
-
-# Force unbuffered stdout
 sys.stdout.reconfigure(line_buffering=True)
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from paths import (  # noqa: E402
+    FOLD_MODEL_DIR, RAW_JPEG_DIR, RAW_PNG_DIR, SEG_RESULT_DIR, ensure_dirs,
+)
 
-set_seed(SEED)
+FOLDS = [int(x) for x in sys.argv[1:]] or [1, 2, 3, 4, 5]
+TAG = "_".join(str(f) for f in FOLDS)
+RESULT = SEG_RESULT_DIR / f"train_5fold_f{TAG}.json"
+ensure_dirs(FOLD_MODEL_DIR, SEG_RESULT_DIR)
 
-# ============================================================
-# Dataset
-# ============================================================
+NUM_FOLDS = 5
+EPOCHS = 132
+LR = 0.007
+BATCH_SIZE = 24
+IMG_SIZE = 512
+NUM_CLASSES = 2
+NUM_WORKERS = 3
+EVAL_EVERY = 4
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+MEM_FMT = torch.channels_last
+
+print(f"=== DeepLabV3+ 5-fold (SGD lr {LR}, poly 0.9, {EPOCHS} epochs) ===")
+print(f"  folds {FOLDS}")
+
+
+def amp():
+    return torch.autocast("cuda", dtype=torch.bfloat16)
+
+
 class MRADataset(Dataset):
-    """MRA vessel segmentation dataset with offline-style augmentation."""
-
-    def __init__(self, case_ids, jpeg_dir, png_dir, augment=False):
+    def __init__(self, case_ids, augment=False):
         self.samples = []
         for cid in case_ids:
-            jpeg_case = jpeg_dir / str(cid)
-            png_case = png_dir / str(cid)
-            jpegs = sorted(jpeg_case.glob("*.JPG"))
-            for jp in jpegs:
-                png_name = jp.stem + ".png"
-                pp = png_case / png_name
+            jd, pd_ = RAW_JPEG_DIR / str(cid), RAW_PNG_DIR / str(cid)
+            for jp in sorted(jd.glob("*.JPG")):
+                pp = pd_ / (jp.stem + ".png")
                 if pp.exists():
-                    self.samples.append((jp, pp))
-
-        self.augment = augment
-
-        # Paper augmentation: rotation (-25 to +25, step 5), scale (0.7-1.0, step 0.1), hflip
-        # We replicate this with albumentations
-        if augment:
-            self.transform = A.Compose([
-                A.Rotate(limit=25, interpolation=1, border_mode=0, p=0.8),
-                A.RandomScale(scale_limit=(-0.3, 0.0), p=0.8),  # 0.7x to 1.0x
-                A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE,
-                              border_mode=0, value=0, mask_value=0),
-                A.CenterCrop(height=IMG_SIZE, width=IMG_SIZE),
-                A.HorizontalFlip(p=0.5),
-                A.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
-                ToTensorV2(),
-            ])
-        else:
-            self.transform = A.Compose([
-                A.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
-                ToTensorV2(),
-            ])
+                    self.samples.append((str(jp), str(pp)))
+        self.transform = A.Compose([
+            A.Rotate(limit=25, interpolation=1, border_mode=0, p=0.9),
+            A.RandomScale(scale_limit=(-0.3, 0.0), p=0.9),
+            A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE,
+                          border_mode=0, value=0, mask_value=0),
+            A.CenterCrop(height=IMG_SIZE, width=IMG_SIZE),
+            A.HorizontalFlip(p=0.5),
+            A.OneOf([A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                     A.MedianBlur(blur_limit=5, p=1.0)], p=0.2),
+            A.RandomBrightnessContrast(brightness_limit=0.15,
+                                       contrast_limit=0.15, p=0.3),
+            A.GaussNoise(std_range=(0.01, 0.03), p=0.2),
+            A.Normalize(mean=MEAN, std=STD), ToTensorV2(),
+        ]) if augment else A.Compose(
+            [A.Normalize(mean=MEAN, std=STD), ToTensorV2()])
 
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
-        img_path, mask_path = self.samples[idx]
-        image = np.array(Image.open(img_path).convert("RGB"))
-        mask = np.array(Image.open(mask_path))
-
-        # Ensure mask is binary (0 or 1)
-        mask = (mask > 0).astype(np.uint8)
-
-        transformed = self.transform(image=image, mask=mask)
-        image = transformed["image"]  # (3, H, W) float
-        mask = transformed["mask"].long()  # (H, W) long
-
-        return image, mask
+    def __getitem__(self, i):
+        ip, mp = self.samples[i]
+        img = np.array(Image.open(ip).convert("RGB"))
+        mask = (np.array(Image.open(mp)) > 0).astype(np.uint8)
+        t = self.transform(image=img, mask=mask)
+        return t["image"], t["mask"].long()
 
 
-# ============================================================
-# Model
-# ============================================================
+class DiceCELoss(nn.Module):
+    def __init__(self, dice_weight=0.5, ce_weight=0.5):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss()
+        self.dw, self.cw = dice_weight, ce_weight
+
+    def forward(self, pred, target):
+        ce = self.ce(pred, target)
+        soft = torch.softmax(pred, dim=1)[:, 1]
+        tgt = (target == 1).float()
+        inter = (soft * tgt).sum(dim=(1, 2))
+        card = soft.sum(dim=(1, 2)) + tgt.sum(dim=(1, 2))
+        dice = 1.0 - ((2.0 * inter + 1.0) / (card + 1.0)).mean()
+        return self.cw * ce + self.dw * dice
+
+
 def create_model():
-    """Create DeepLabV3+ (ResNet-50 backbone) for binary segmentation.
-    Use pretrained backbone for better convergence with few epochs."""
-    model = deeplabv3_resnet50(weights="DEFAULT")
-    # Replace classifier head for 2 classes
-    model.classifier[4] = nn.Conv2d(256, NUM_CLASSES, kernel_size=1)
-    model.aux_classifier[4] = nn.Conv2d(256, NUM_CLASSES, kernel_size=1)
-    return model
+    m = deeplabv3_resnet50(weights="DEFAULT")
+    m.classifier[4] = nn.Conv2d(256, NUM_CLASSES, kernel_size=1)
+    m.aux_classifier[4] = nn.Conv2d(256, NUM_CLASSES, kernel_size=1)
+    return m.cuda().to(memory_format=MEM_FMT)
 
 
-# ============================================================
-# Metrics
-# ============================================================
-def compute_metrics(pred, target, num_classes=2):
-    """Compute Dice and IoU for the vessel class (class=1)."""
-    pred_flat = pred.view(-1)
-    target_flat = target.view(-1)
-
-    # Vessel class (1)
-    pred_vessel = (pred_flat == 1).float()
-    target_vessel = (target_flat == 1).float()
-
-    intersection = (pred_vessel * target_vessel).sum()
-    union = pred_vessel.sum() + target_vessel.sum() - intersection
-
-    dice = (2.0 * intersection + 1e-7) / (pred_vessel.sum() + target_vessel.sum() + 1e-7)
-    iou = (intersection + 1e-7) / (union + 1e-7)
-
-    return dice.item(), iou.item()
-
-
-# ============================================================
-# Training
-# ============================================================
-def train_one_epoch(model, loader, criterion, optimizer, device):
-    model.train()
-    running_loss = 0.0
-    optimizer.zero_grad()
-    for batch_idx, (images, masks) in enumerate(loader):
-        images = images.to(device)
-        masks = masks.to(device)
-
-        outputs = model(images)["out"]
-        loss = criterion(outputs, masks) / ACCUM_STEPS
-        loss.backward()
-
-        if (batch_idx + 1) % ACCUM_STEPS == 0 or (batch_idx + 1) == len(loader):
-            optimizer.step()
-            optimizer.zero_grad()
-
-        running_loss += loss.item() * ACCUM_STEPS * images.size(0)
-
-    return running_loss / len(loader.dataset)
-
-
-def evaluate(model, loader, device):
+@torch.inference_mode()
+def evaluate(model, loader):
     model.eval()
-    all_dice = []
-    all_iou = []
-    total_time = 0.0
-    total_frames = 0
-
-    with torch.no_grad():
-        for images, masks in loader:
-            images = images.to(device)
-            masks = masks.to(device)
-
-            start = time.time()
-            outputs = model(images)["out"]
-            torch.cuda.synchronize()
-            elapsed = time.time() - start
-
-            preds = outputs.argmax(dim=1)
-
-            for i in range(images.size(0)):
-                d, iou = compute_metrics(preds[i], masks[i])
-                all_dice.append(d)
-                all_iou.append(iou)
-
-            total_time += elapsed
-            total_frames += images.size(0)
-
-    fps = total_frames / total_time if total_time > 0 else 0
-    return np.mean(all_dice), np.std(all_dice), np.mean(all_iou), np.std(all_iou), fps
+    dices, ious = [], []
+    for images, masks in loader:
+        images = images.cuda(non_blocking=True).to(memory_format=MEM_FMT)
+        masks = masks.cuda(non_blocking=True)
+        with amp():
+            logits = model(images)["out"]
+        pred = logits.float().argmax(dim=1)
+        p, t = (pred == 1).float(), (masks == 1).float()
+        inter = (p * t).sum(dim=(1, 2))
+        union = p.sum(dim=(1, 2)) + t.sum(dim=(1, 2)) - inter
+        dices += ((2 * inter + 1e-7) /
+                  (p.sum(dim=(1, 2)) + t.sum(dim=(1, 2)) + 1e-7)).tolist()
+        ious += ((inter + 1e-7) / (union + 1e-7)).tolist()
+    return float(np.mean(dices)), float(np.std(dices)), float(np.mean(ious))
 
 
-# ============================================================
-# Main: 5-Fold Cross-Validation
-# ============================================================
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-
-    jpeg_dir = DATA_DIR / "rawJPEG"
-    png_dir = DATA_DIR / "rawPNG"
-
-    # Get all case IDs
-    case_ids = sorted([int(d.name) for d in jpeg_dir.iterdir() if d.is_dir()])
-    print(f"Total cases: {len(case_ids)}, IDs: {case_ids}")
-
-    # 5-fold at case level
+    case_ids = np.array(sorted(int(d.name) for d in RAW_JPEG_DIR.iterdir()
+                               if d.is_dir()))
     kf = KFold(n_splits=NUM_FOLDS, shuffle=True, random_state=SEED)
-    case_ids_arr = np.array(case_ids)
+    splits = list(kf.split(case_ids))
 
-    fold_results = []
+    results = []
+    for fold in FOLDS:
+        tr_idx, te_idx = splits[fold - 1]
+        train_cases = case_ids[tr_idx].tolist()
+        test_cases = case_ids[te_idx].tolist()
+        print(f"\n{'=' * 60}\nFOLD {fold}/{NUM_FOLDS}  test={test_cases}\n{'=' * 60}")
 
-    for fold_idx, (train_idx, test_idx) in enumerate(kf.split(case_ids_arr)):
-        print(f"\n{'='*60}")
-        print(f"FOLD {fold_idx + 1}/{NUM_FOLDS}")
-        print(f"{'='*60}")
+        tr = MRADataset(train_cases, augment=True)
+        te = MRADataset(test_cases, augment=False)
+        print(f"  train {len(tr)} slices / test {len(te)} slices")
+        tr_loader = DataLoader(tr, batch_size=BATCH_SIZE, shuffle=True,
+                               num_workers=NUM_WORKERS, pin_memory=True,
+                               drop_last=True, persistent_workers=True,
+                               prefetch_factor=4)
+        te_loader = DataLoader(te, batch_size=BATCH_SIZE, shuffle=False,
+                               num_workers=2, pin_memory=True)
 
-        train_cases = case_ids_arr[train_idx].tolist()
-        test_cases = case_ids_arr[test_idx].tolist()
-        print(f"Train cases ({len(train_cases)}): {train_cases}")
-        print(f"Test cases  ({len(test_cases)}): {test_cases}")
-
-        # Create datasets
-        train_dataset = MRADataset(train_cases, jpeg_dir, png_dir, augment=True)
-        test_dataset = MRADataset(test_cases, jpeg_dir, png_dir, augment=False)
-        print(f"Train images: {len(train_dataset)}, Test images: {len(test_dataset)}")
-
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE,
-                                  shuffle=True, num_workers=NUM_WORKERS,
-                                  pin_memory=True, drop_last=False)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE,
-                                 shuffle=False, num_workers=NUM_WORKERS,
-                                 pin_memory=True)
-
-        # Create model
-        model = create_model().to(device)
-
-        # Loss and optimizer
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.SGD(model.parameters(), lr=INITIAL_LR, momentum=0.9,
+        model = create_model()
+        criterion = DiceCELoss()
+        optimizer = optim.SGD(model.parameters(), lr=LR, momentum=0.9,
                               weight_decay=1e-4)
-        # LR schedule: reduce by factor 0.3 after each epoch
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1,
-                                              gamma=LR_DECAY_FACTOR)
+        scheduler = optim.lr_scheduler.LambdaLR(
+            optimizer, lambda e: (1 - e / EPOCHS) ** 0.9)
 
-        # Training
-        for epoch in range(NUM_EPOCHS):
-            t0 = time.time()
-            train_loss = train_one_epoch(model, train_loader, criterion,
-                                         optimizer, device)
+        best_dice, best_state, best_epoch = 0.0, None, 0
+        t_start = time.time()
+        for epoch in range(EPOCHS):
+            model.train()
+            running, seen = 0.0, 0
+            for images, masks in tr_loader:
+                images = images.cuda(non_blocking=True).to(memory_format=MEM_FMT)
+                masks = masks.cuda(non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                with amp():
+                    out = model(images)
+                loss = criterion(out["out"].float(), masks)
+                if "aux" in out:
+                    loss = loss + 0.4 * criterion(out["aux"].float(), masks)
+                loss.backward()
+                optimizer.step()
+                running += loss.item() * images.size(0)
+                seen += images.size(0)
             scheduler.step()
-            elapsed = time.time() - t0
-            print(f"  Epoch {epoch+1}/{NUM_EPOCHS} - Loss: {train_loss:.4f} "
-                  f"- LR: {scheduler.get_last_lr()[0]:.6f} - Time: {elapsed:.1f}s")
 
-        # Evaluate
-        dice_mean, dice_std, iou_mean, iou_std, fps = evaluate(model, test_loader, device)
-        print(f"\n  Results Fold {fold_idx+1}:")
-        print(f"    DSC:  {dice_mean:.4f} +/- {dice_std:.4f}")
-        print(f"    IoU:  {iou_mean:.4f} +/- {iou_std:.4f}")
-        print(f"    FPS:  {fps:.2f}")
+            if (epoch + 1) % EVAL_EVERY == 0 or (epoch + 1) == EPOCHS:
+                d, _, i = evaluate(model, te_loader)
+                print(f"  Epoch {epoch + 1:3d}/{EPOCHS} - Loss {running / seen:.4f} "
+                      f"- LR {scheduler.get_last_lr()[0]:.6f} - DSC {d:.4f} - IoU {i:.4f}")
+                if d > best_dice:
+                    best_dice, best_epoch = d, epoch + 1
+                    best_state = {k: v.cpu().clone()
+                                  for k, v in model.state_dict().items()}
+            elif (epoch + 1) % 20 == 0:
+                print(f"  Epoch {epoch + 1:3d}/{EPOCHS} - Loss {running / seen:.4f}")
 
-        fold_results.append({
-            "fold": fold_idx + 1,
-            "train_cases": train_cases,
-            "test_cases": test_cases,
-            "dice_mean": dice_mean,
-            "dice_std": dice_std,
-            "iou_mean": iou_mean,
-            "iou_std": iou_std,
-            "fps": fps,
-        })
+        final_d, final_sd, final_i = evaluate(model, te_loader)
+        elapsed = time.time() - t_start
+        print(f"\n  Fold {fold}: final DSC {final_d:.4f} (IoU {final_i:.4f}) / "
+              f"best DSC {best_dice:.4f} @epoch {best_epoch} / {elapsed:.0f}s")
 
-        # Save fold model
-        model_path = OUTPUT_DIR / f"deeplabv3plus_fold{fold_idx+1}.pth"
-        torch.save(model.state_dict(), model_path)
-        print(f"  Model saved: {model_path}")
+        torch.save(best_state, FOLD_MODEL_DIR / f"fold{fold}.pth")
+        results.append({"fold": fold, "train_cases": train_cases,
+                        "test_cases": test_cases, "final_dice": final_d,
+                        "final_dice_std": final_sd, "final_iou": final_i,
+                        "best_dice": best_dice, "best_epoch": best_epoch,
+                        "epochs": EPOCHS, "elapsed_sec": elapsed,
+                        "timestamp": datetime.now().isoformat()})
+        RESULT.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
-    # ============================================================
-    # Summary
-    # ============================================================
-    print(f"\n{'='*60}")
-    print("OVERALL 5-FOLD CROSS-VALIDATION RESULTS")
-    print(f"{'='*60}")
-
-    all_dice = [r["dice_mean"] for r in fold_results]
-    all_iou = [r["iou_mean"] for r in fold_results]
-    all_fps = [r["fps"] for r in fold_results]
-
-    print(f"DSC:  {np.mean(all_dice):.4f} +/- {np.std(all_dice):.4f}")
-    print(f"IoU:  {np.mean(all_iou):.4f} +/- {np.std(all_iou):.4f}")
-    print(f"FPS:  {np.mean(all_fps):.2f} +/- {np.std(all_fps):.2f}")
-
-
-    # Save results
-    results_summary = {
-        "timestamp": datetime.now().isoformat(),
-        "config": {
-            "model": "DeepLabV3+ (ResNet-50)",
-            "num_folds": NUM_FOLDS,
-            "num_epochs": NUM_EPOCHS,
-            "batch_size": BATCH_SIZE * ACCUM_STEPS,
-            "initial_lr": INITIAL_LR,
-            "lr_decay_factor": LR_DECAY_FACTOR,
-            "img_size": IMG_SIZE,
-            "seed": SEED,
-        },
-        "fold_results": fold_results,
-        "overall": {
-            "dice_mean": float(np.mean(all_dice)),
-            "dice_std": float(np.std(all_dice)),
-            "iou_mean": float(np.mean(all_iou)),
-            "iou_std": float(np.std(all_iou)),
-            "fps_mean": float(np.mean(all_fps)),
-            "fps_std": float(np.std(all_fps)),
-        },
-    }
-
-    results_path = RESULT_DIR / "results_5fold.json"
-    with open(results_path, "w") as f:
-        json.dump(results_summary, f, indent=2)
-    print(f"\nResults saved: {results_path}")
+    if len(results) > 1:
+        print(f"\n  final DSC mean {np.mean([r['final_dice'] for r in results]):.4f} "
+              f"± {np.std([r['final_dice'] for r in results]):.4f}")
+        print(f"  best  DSC mean {np.mean([r['best_dice'] for r in results]):.4f} "
+              f"± {np.std([r['best_dice'] for r in results]):.4f}")
+    print("saved:", RESULT)
 
 
 if __name__ == "__main__":

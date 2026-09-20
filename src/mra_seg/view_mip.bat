@@ -3,7 +3,7 @@ setlocal
 REM ============================================================
 REM MRA MIP (Maximum Intensity Projection) Comparison Viewer
 REM Shows the MIP of each held-out test case:
-REM   Original | GT Masked | Initial | Round1 | Round2
+REM   Original | GT Masked | Seed | Retained models
 REM
 REM Controls:
 REM   Left/Right arrows or mouse wheel: switch cases

@@ -37,17 +37,15 @@ MRA_STUDY_DIR = DATA_DIR / "mra_studies"
 # ------------------------------------------------------------------
 # Models and results
 # ------------------------------------------------------------------
+# Seed checkpoints written by train_deeplabv3plus_5fold.py (fold1.pth .. fold5.pth)
 FOLD_MODEL_DIR = MODELS_DIR / "deeplabv3plus_5fold"
-FOLD_MODEL_V1_DIR = MODELS_DIR / "deeplabv3plus_5fold_v1"
-INITIAL_MODEL = FOLD_MODEL_DIR / "deeplabv3plus_fold5.pth"
 
-EVOLUTION_DIR = MODELS_DIR / "evolution"        # naive strategy
-EVOLUTION_V2_DIR = MODELS_DIR / "evolution_v2"  # improved strategy
+# Evolutionary runs: one sub-directory per run, named <configuration>_fold<k>
+EVOLUTION_DIR = MODELS_DIR / "evolution"
 
 SEG_RESULT_DIR = RESULTS_DIR / "mra_seg"
 SEG_FIGURE_DIR = SEG_RESULT_DIR / "figures"
-EVOLUTION_LOG = SEG_RESULT_DIR / "evolution_log.json"
-EVOLUTION_LOG_V2 = SEG_RESULT_DIR / "evolution_log_v2.json"
+ANALYSIS_DIR = RESULTS_DIR / "analysis"
 
 
 def require_external(path, what):
@@ -73,8 +71,8 @@ if __name__ == "__main__":
     for name, p in [
         ("RAW_JPEG_DIR", RAW_JPEG_DIR), ("RAW_PNG_DIR", RAW_PNG_DIR),
         ("MRA_DICOM_DIR", MRA_DICOM_DIR), ("MRA_STUDY_DIR", MRA_STUDY_DIR),
-        ("FOLD_MODEL_DIR", FOLD_MODEL_DIR), ("INITIAL_MODEL", INITIAL_MODEL),
-        ("EVOLUTION_DIR", EVOLUTION_DIR), ("EVOLUTION_V2_DIR", EVOLUTION_V2_DIR),
-        ("SEG_RESULT_DIR", SEG_RESULT_DIR), ("PYTHON_EXE", PYTHON_EXE),
+        ("FOLD_MODEL_DIR", FOLD_MODEL_DIR), ("EVOLUTION_DIR", EVOLUTION_DIR),
+        ("SEG_RESULT_DIR", SEG_RESULT_DIR), ("ANALYSIS_DIR", ANALYSIS_DIR),
+        ("PYTHON_EXE", PYTHON_EXE),
     ]:
         print(f"  [{'OK ' if p.exists() else '-- '}] {name:20s} {p}")

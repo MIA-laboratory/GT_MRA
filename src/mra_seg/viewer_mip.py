@@ -28,7 +28,7 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from paths import (  # noqa: E402
     RAW_JPEG_DIR, RAW_PNG_DIR, MRA_DICOM_DIR,
-    INITIAL_MODEL, EVOLUTION_DIR, EVOLUTION_V2_DIR,
+    FOLD_MODEL_DIR, EVOLUTION_DIR,
 )
 
 JPEG_DIR = RAW_JPEG_DIR
@@ -38,9 +38,9 @@ DICOM_DIR = MRA_DICOM_DIR
 # Intermediate checkpoints may be absent. Load whatever is present and
 # drop the panel for anything that is not.
 _MODEL_CANDIDATES = {
-    "Initial": INITIAL_MODEL,
-    "Round1 Gen10": EVOLUTION_DIR / "model_gen010.pth",
-    "Round2 Final": EVOLUTION_V2_DIR / "model_final_v2.pth",
+    "Seed (fold 1)": FOLD_MODEL_DIR / "fold1.pth",
+    "Naive retained": EVOLUTION_DIR / "naive_fold1" / "model_final.pth",
+    "Strict-combined retained": EVOLUTION_DIR / "strict-combined_fold1" / "model_final.pth",
 }
 MODELS = {name: p for name, p in _MODEL_CANDIDATES.items() if p.exists()}
 for _name, _p in _MODEL_CANDIDATES.items():
@@ -222,8 +222,9 @@ class MIPViewer:
         self.axis_names = ["Axial", "Coronal", "Sagittal"]
 
         # Lay out only the panels whose model was actually loaded
-        _all_cols = ["Original", "GT Masked", "Initial", "Round1 Gen10", "Round2 Final"]
-        _all_colors = ["#bbbbbb", "#4caf50", "#4fc3f7", "#ff8a65", "#81c784"]
+        _all_cols = ["Original", "GT Masked"] + list(MODELS)
+        _all_colors = (["#bbbbbb", "#4caf50"]
+                       + ["#4fc3f7", "#ff8a65", "#81c784"][:len(MODELS)])
         _present = case_data[0]["volumes"]
         self.col_names = [n for n in _all_cols if n in _present]
         self.col_colors = [c for n, c in zip(_all_cols, _all_colors) if n in _present]
@@ -427,7 +428,7 @@ class MIPViewer:
             text=f"Pixel: {ps:.3f}mm  Slice: {ss:.3f}mm")
 
         dsc_parts = []
-        for mname in ["Initial", "Round1 Gen10", "Round2 Final"]:
+        for mname in MODELS:
             d = cd["dsc"][mname]
             dsc_parts.append(f"{mname}: {d:.4f}")
         self.dice_label.config(text="DSC  " + "  |  ".join(dsc_parts))

@@ -1,9 +1,8 @@
 """
 Segmentation Overlay Viewer
 ============================
-Side-by-side comparison of two model predictions on Fold 1 test data.
-Left: Initial model (Gen 0 / fold5)
-Right: Evolutionary model (Gen 10)
+Side-by-side comparison of two model predictions on the holdout cases.
+Left: seed model.  Right: retained model of a chosen run (edit MODEL_GEN10).
 Ground truth contour shown in green on both panels.
 Mouse wheel to scroll through slices (synchronized).
 """
@@ -27,14 +26,13 @@ sys.stdout.reconfigure(line_buffering=True)
 # ============================================================
 # All paths live in paths.py, resolved relative to the project root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from paths import RAW_JPEG_DIR, RAW_PNG_DIR, INITIAL_MODEL, EVOLUTION_DIR  # noqa: E402
+from paths import RAW_JPEG_DIR, RAW_PNG_DIR, FOLD_MODEL_DIR, EVOLUTION_DIR  # noqa: E402
 
 JPEG_DIR = RAW_JPEG_DIR
 PNG_DIR = RAW_PNG_DIR
-MODEL_INITIAL = INITIAL_MODEL
-MODEL_GEN10 = EVOLUTION_DIR / "model_gen010.pth"   # intermediate checkpoint
+MODEL_INITIAL = FOLD_MODEL_DIR / "fold1.pth"
+MODEL_GEN10 = EVOLUTION_DIR / "strict-combined_fold1" / "model_final.pth"
 
-# Fold 1 test cases
 # Case IDs to display. Set these for your own dataset.
 TEST_CASES: list[int] = []
 IMG_SIZE = 512
@@ -174,9 +172,9 @@ class OverlayViewer:
         header = tk.Frame(root, bg="#1e1e1e")
         header.pack(fill=tk.X, padx=10, pady=5)
 
-        tk.Label(header, text="Initial Model (Gen 0)",
+        tk.Label(header, text="Seed model",
                  font=("Consolas", 14, "bold"), fg="#4fc3f7", bg="#1e1e1e").pack(side=tk.LEFT, expand=True)
-        tk.Label(header, text="Evolutionary Model (Gen 10)",
+        tk.Label(header, text="Retained model",
                  font=("Consolas", 14, "bold"), fg="#ff8a65", bg="#1e1e1e").pack(side=tk.RIGHT, expand=True)
 
         # --- Image panels ---
@@ -272,7 +270,7 @@ class OverlayViewer:
         self.info_label.config(
             text=f"Slice {idx + 1}/{self.total}  |  {label}")
         self.dice_label.config(
-            text=f"DSC  Initial: {self.dice_left[idx]:.4f}    Gen10: {self.dice_right[idx]:.4f}    "
+            text=f"DSC  Seed: {self.dice_left[idx]:.4f}    Retained: {self.dice_right[idx]:.4f}    "
                  f"Diff: {self.dice_right[idx] - self.dice_left[idx]:+.4f}")
 
 
@@ -294,7 +292,7 @@ def main():
     model_initial = load_model(MODEL_INITIAL, device)
     model_gen10 = load_model(MODEL_GEN10, device)
     print(f"  Initial model: {MODEL_INITIAL.name}")
-    print(f"  Gen10 model:   {MODEL_GEN10.name}")
+    print(f"  Retained model: {MODEL_GEN10.name}")
 
     print("Loading test data (Fold 1 test cases)...")
     samples = load_test_data()
@@ -306,7 +304,7 @@ def main():
     print("Running inference with initial model...")
     preds_initial = run_inference(model_initial, images_np, device)
 
-    print("Running inference with Gen 10 model...")
+    print("Running inference with the retained model...")
     preds_gen10 = run_inference(model_gen10, images_np, device)
 
     print("Generating overlays...")
@@ -334,7 +332,7 @@ def main():
     # Summary
     mean_dl = np.mean(dice_left)
     mean_dr = np.mean(dice_right)
-    print(f"\nMean DSC  Initial: {mean_dl:.4f}  Gen10: {mean_dr:.4f}  Diff: {mean_dr - mean_dl:+.4f}")
+    print(f"\nMean DSC  Seed: {mean_dl:.4f}  Retained: {mean_dr:.4f}  Diff: {mean_dr - mean_dl:+.4f}")
     print(f"\nLaunching viewer ({len(samples)} slices)...")
 
     # Launch GUI
