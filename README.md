@@ -2,55 +2,62 @@
 
 Source code for the study
 
-> **Evolutionary Knowledge Update for Intracranial Vessel Segmentation in TOF-MRA:
+> **Evolutionary Knowledge Update for Intracranial Region Segmentation in TOF-MRA:
 > Self-Training from Few Labeled Cases**
 >
 > Hiroyuki Sugimori and Takaaki Yoshimura
+> *Applied Sciences* 2026, 16, 9320 — https://doi.org/10.3390/app16189320
 
-A DeepLabV3+ model for intracranial vessel segmentation in Time-of-Flight MR
-Angiography is initialised from a small labeled dataset and then evolved on unlabeled
-clinical examinations. Confidence-based pseudo-label gating, elastic weight
-consolidation (EWC) and an evolutionary rollback rule are combined so that
-**performance cannot degrade across updates**.
+A DeepLabV3+ model for intracranial region segmentation in Time-of-Flight MR
+Angiography is initialised from a small labeled dataset and then updated by
+self-training on unlabeled clinical examinations, with confidence-gated
+pseudo-labels, elastic weight consolidation (EWC), and a rollback rule. The study
+runs this framework in six configurations (eight runs over two seeds) and reports
+what it does — in particular, that the selection rule compares candidates against
+the **recorded best score** while acceptance replaces the **stored checkpoint**:
+with a tolerance δ > 0 under replace-on-acceptance these two separate, and the
+deployed model can degrade while the recorded best never moves. With δ = 0 and
+replacement only on strict improvement, the record tracks the deployed model by
+construction.
 
 ## Framework
 
 ![Evolutionary knowledge update framework](docs/framework.png)
 
-Phase 0 builds the initial model from the labeled dataset; Phases 1–4 are repeated
-for each 100-case batch of unlabeled data.
+*Figure 1 of the article (CC BY 4.0).*
+
+Phase 0 builds the seed model from the 16 training cases of one cross-validation
+fold; the fold's remaining four cases form the holdout used in Phase 4 and
+nowhere else. Phases 1–4 are repeated for each 100-case batch of unlabeled data.
 
 ```mermaid
 flowchart LR
-    P0["<b>Phase 0</b><br>Initial model<br>small labeled dataset<br>DeepLabV3+ / ResNet-50"]
+    P0["<b>Phase 0</b><br>Seed model<br>16 labeled cases<br>DeepLabV3+ / ResNet-50"]
     P1["<b>Phase 1</b><br>Batch inference<br>100 unlabeled cases<br>softmax confidence"]
-    P2["<b>Phase 2</b><br>Quality gate<br>threshold τ = 0.97<br>pseudo-labels ≤ 2× labeled"]
-    P3["<b>Phase 3</b><br>Re-training<br>weighted loss 1.0 / 0.3<br>EWC + differential LR"]
-    P4{"<b>Phase 4</b><br>Evolutionary selection<br>DSC ≥ best − δ ?"}
-    KEEP["Accept<br>(update model)"]
-    BACK["Roll back<br>(restore previous best)"]
+    P2["<b>Phase 2</b><br>Quality gate<br>threshold τ, capped pool<br>top-confidence or stratified"]
+    P3["<b>Phase 3</b><br>Re-training<br>weighted loss, EWC anchored<br>to the seed parameters"]
+    P4{"<b>Phase 4</b><br>Selection<br>compare against DSC_best,<br>replace the stored checkpoint"}
+    KEEP["Accept<br>(replace checkpoint)"]
+    BACK["Roll back<br>(restore checkpoint)"]
 
     P0 --> P1 --> P2 --> P3 --> P4
-    P4 -- yes --> KEEP
-    P4 -- no --> BACK
+    P4 -- accepted --> KEEP
+    P4 -- rejected --> BACK
     KEEP -- next batch --> P1
     BACK -- next batch --> P1
 ```
 
 ## Method
 
-### Initial model
+### Seed model
 
 A combined Dice–cross-entropy loss is used for the supervised stage:
 
 $$\mathcal{L}_{\text{total}} = 0.5\,\mathcal{L}_{\text{CE}} + 0.5\,\mathcal{L}_{\text{Dice}}$$
 
-$$\mathcal{L}_{\text{CE}} = -\frac{1}{N}\sum_{i}\Big[\,g_i \log p_i + (1-g_i)\log(1-p_i)\,\Big]$$
-
-$$\mathcal{L}_{\text{Dice}} = 1 - \frac{2\sum_{i} p_i g_i + \varepsilon}{\sum_{i} p_i + \sum_{i} g_i + \varepsilon}$$
-
-Segmentation quality is reported with the Dice similarity coefficient and the
-intersection over union, where $S$ is the prediction and $G$ the ground truth:
+Segmentation quality is reported with the Dice similarity coefficient (DSC) and
+the intersection over union (IoU), where $S$ is the prediction and $G$ the
+ground truth:
 
 $$\mathrm{DSC} = \frac{2\,|S \cap G|}{|S| + |G|}
 \qquad
@@ -63,51 +70,80 @@ pixels and $k$ classes:
 
 $$c = \frac{1}{HW}\sum_{h,w}\ \max_{k}\ p_k(h,w)$$
 
+This score is confounded by anatomy: it correlates negatively with the predicted
+foreground fraction, and on labeled slices it tended to rank less accurate
+model-generated labels higher (Section 3.4 of the paper;
+`diagnose_confidence.py`, `conf_vs_accuracy.py`).
+
 ### Phase 2 — quality gate
 
-Slices with $c > \tau$ are kept, capped at a multiple $\rho$ of the labeled set:
-
-$$N_{\text{pseudo}} = \min\big(\rho \cdot N_{L},\ N_{\text{candidates}}\big)$$
+Slices with $c > \tau$ are kept, capped at
+$N_{\text{pseudo}} = \min(\rho \cdot N_{L},\ N_{\text{candidates}})$ or at a
+fixed count. The pool is cumulative across generations and truncated to the cap
+by confidence. Two selection rules are used: **top-conf** keeps the
+highest-confidence slices directly; **stratified** divides the predicted
+foreground fraction into ten equal-width strata (width 0.06; slices at or above
+0.60 join the top stratum), gives each stratum an equal quota of
+$N_{\text{pseudo}}/10$ filled by the highest-confidence slices within the
+stratum, and does not reallocate shortfalls.
 
 ### Phase 3 — weighted re-training with EWC
 
-Labeled and pseudo-labeled samples enter the loss with different weights
-($w_L = 1.0$, $w_P = 0.3$ in the improved strategy):
-
-$$\mathcal{L}_{\text{weighted}} = \frac{1}{N}\sum_{i} w_i \cdot
-\mathcal{L}_{\text{total}}(p_i, y_i)$$
-
-Elastic weight consolidation penalises movement away from the parameters
-$\theta^{*}$ learned from labeled data, weighted by the Fisher information $F_i$:
+Labeled and pseudo-labeled samples enter the loss with weights $w_L = 1.0$ and
+$w_P$. EWC penalises movement away from the seed parameters $\theta^{*}$,
+weighted by the Fisher information $F_i$ (estimated once from the seed and held
+fixed, so the anchor never moves):
 
 $$\mathcal{L}_{\text{EWC}} = \lambda \sum_{i} F_i\,(\theta_i - \theta_i^{*})^{2}$$
 
-$$F_i = \mathbb{E}_{x \sim D}\left[\left(\frac{\partial \log p(y \mid x, \theta^{*})}
-{\partial \theta_i}\right)^{2}\right]$$
+### Phase 4 — selection rule and checkpoint policy
 
-### Phase 4 — evolutionary selection
-
-The update is accepted only if it holds performance within a margin $\delta$ on the
-holdout set; otherwise the previous best model is restored. This is what makes the
-procedure monotonically non-degrading:
+A candidate is accepted when its holdout score lies within a tolerance δ of the
+best score recorded over all previous generations:
 
 $$\text{Action} =
 \begin{cases}
-\text{Accept}, & \text{if } \mathrm{DSC}_{\text{new}} \ge \mathrm{DSC}_{\text{best}} - \delta\\
+\text{Accept}, & \text{if } \mathrm{DSC}_{\text{cand}} \ge \mathrm{DSC}_{\text{best}} - \delta\\
 \text{Rollback}, & \text{otherwise}
 \end{cases}$$
 
-### Strategies compared
+Two quantities are involved and they are not the same: $\mathrm{DSC}_{\text{best}}$
+is a record, updated only when a candidate exceeds it; the stored checkpoint is
+what would be deployed. With δ = 0 and replacement only on strict improvement
+the two move together. With δ > 0 under replace-on-acceptance they separate: in
+the paper's Naive runs the deployed model fell by 0.0046 and 0.0033 while the
+recorded best never moved. The paper therefore recommends δ = 0 as the default,
+and — where a tolerance is genuinely needed — retaining the best-scoring rather
+than the most recently accepted checkpoint, and monitoring the retained
+checkpoint's measured score, never the record.
 
-| Parameter | Naive | Improved |
-|---|---|---|
-| Pseudo loss weight $w_P$ | 1.0 | 0.3 |
-| Confidence threshold $\tau$ | 0.80 | 0.97 |
-| Pseudo-label ratio $\rho$ | ~7.6× | 2.0× |
-| LR (backbone / head) | 0.001 / 0.001 | 0.00005 / 0.0005 |
-| EWC $\lambda$ | 500 | 1,000 |
-| Backbone freeze | no | first 2 epochs |
-| Rollback margin $\delta$ | 0.005 | 0.003 |
+### Configurations (Table 1 of the paper)
+
+| Configuration | Seeds | δ | Checkpoint rule | Selection | Pool | EWC λ | $w_P$ | τ | Epochs |
+|---|---|---|---|---|---|---|---|---|---|
+| Naive | fold 1, 2 | 0.005 | DSC ≥ best − δ | top-conf | 20,000 | 500 | 1.0 | 0.80 | 5 |
+| Strict-topconf | fold 1, 2 | 0 | DSC > best | top-conf | 2× labeled | 1,000 | 0.3 | 0.97 | 7 |
+| Strict-stratified | fold 1 | 0 | DSC > best | stratified | 2× labeled | 1,000 | 0.3 | 0.97 | 7 |
+| Strict-large-pool | fold 1 | 0 | DSC > best | top-conf | 20,000 | 1,000 | 0.3 | 0.97 | 7 |
+| Strict-weak-EWC | fold 1 | 0 | DSC > best | top-conf | 2× labeled | 100 | 0.3 | 0.97 | 7 |
+| Strict-combined | fold 1 | 0 | DSC > best | stratified | 20,000 | 100 | 0.3 | 0.97 | 7 |
+
+Naive differs from the δ = 0 family in its re-training settings as well as in
+its rule; the comparison isolates no single factor (Section 2.6 of the paper).
+
+## Reproducing the study
+
+```
+python\python.exe src\paths.py                                # check resolved paths
+python\python.exe src\mra_seg\train_deeplabv3plus_5fold.py    # seeds, 5-fold CV
+python\python.exe src\mra_seg\evolutionary_learning.py <configuration> [fold]
+python\python.exe src\mra_seg\eval_retained_models.py <fold>  # Tables 3-4
+python\python.exe src\mra_seg\eval_dsc_aggregation.py         # Tables 2, 5
+python\python.exe src\mra_seg\eval_mip_contamination.py <fold> <configuration>
+python\python.exe src\mra_seg\mip_percase_stats.py <fold> <configuration>   # Table 6 context
+python\python.exe src\mra_seg\diagnose_confidence.py [fold]   # Figure 4
+python\python.exe src\mra_seg\conf_vs_accuracy.py [fold]      # Section 3.4
+```
 
 ## Data
 
@@ -125,6 +161,7 @@ The scripts expect the following layout relative to the project root:
 │  ├─ rawJPEG/             input slices, per-case folders
 │  ├─ rawPNG/              ground-truth masks, same filenames
 │  └─ DICOMdata/           source DICOM (spacing / MIP)
+├─ data/mra_studies/       unlabeled DICOM studies (not included)
 ├─ models/
 ├─ results/
 └─ src/                    this repository
@@ -137,21 +174,22 @@ src/
 ├─ paths.py                 all paths in one place, resolved relative to the
 │                           project root (nothing is hard-coded)
 └─ mra_seg/
-   ├─ train_deeplabv3plus_5fold.py      initial model, 5-fold CV
-   ├─ train_deeplabv3plus_5fold_v2.py   final version (multi-GPU, Dice-CE)
-   ├─ evolutionary_learning.py          naive self-training
-   ├─ evolutionary_learning_v2.py       improved: weighted pseudo-label loss,
-   │                                    strict confidence gate, ratio cap,
-   │                                    differential LR, EWC, rollback
-   ├─ viewer_mip.py                     MIP viewer (axial/coronal/sagittal, WW/WL)
-   ├─ viewer_overlay.py / _v2.py        overlay comparison viewers
-   ├─ plot_evolution.py                 evolution curves
-   └─ *.bat                             launchers (call the bundled python)
+   ├─ train_deeplabv3plus_5fold.py   seed models (SGD, poly decay, 132 epochs)
+   ├─ evolutionary_learning.py       the framework: six configurations
+   ├─ eval_retained_models.py        fp32 re-measurement of every checkpoint
+   ├─ eval_dsc_aggregation.py        slice mean / case mean / global DSC
+   ├─ eval_mip_contamination.py      task-relevant MIP measure
+   ├─ mip_percase_stats.py           case-to-case variability of the MIP deltas
+   ├─ diagnose_confidence.py         what the confidence score ranks
+   ├─ conf_vs_accuracy.py            confidence vs. per-slice label accuracy
+   ├─ viewer_mip.py                  MIP viewer (axial/coronal/sagittal, WW/WL)
+   ├─ viewer_overlay.py              overlay comparison viewer
+   └─ *.bat                          launchers (call the bundled python)
 ```
 
-Dataset-specific settings (the case IDs held out for validation, the location of
-the unlabeled study store) are empty constants at the top of the scripts; fill
-them in for your own data before running.
+The five-fold split is derived from `KFold(n_splits=5, shuffle=True,
+random_state=42)` over the sorted case IDs, so every script reproduces the same
+train/holdout partition without hard-coded case lists.
 
 ## Environment
 
@@ -164,12 +202,25 @@ python\python.exe -m pip install -r requirements.txt
 python\python.exe src\paths.py          # print resolved paths
 ```
 
-Training used three NVIDIA RTX PRO 6000 GPUs via `DataParallel`; the scripts detect
-the available GPUs rather than assuming a fixed count.
+The runs in the paper used one NVIDIA GPU per configuration (bf16 autocast,
+channels_last); the scripts detect the available GPUs rather than assuming a
+fixed count.
 
 ## Citation
 
-Please cite the article once it is published. Details will be added here.
+```bibtex
+@article{Sugimori2026GTMRA,
+  author  = {Sugimori, Hiroyuki and Yoshimura, Takaaki},
+  title   = {Evolutionary Knowledge Update for Intracranial Region Segmentation
+             in TOF-MRA: Self-Training from Few Labeled Cases},
+  journal = {Applied Sciences},
+  year    = {2026},
+  volume  = {16},
+  number  = {18},
+  pages   = {9320},
+  doi     = {10.3390/app16189320}
+}
+```
 
 ## License
 
